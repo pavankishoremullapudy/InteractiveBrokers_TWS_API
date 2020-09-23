@@ -1,7 +1,7 @@
-''' Reads continuous futures contracts '''
+''' Reads continuous futures contracts and writes to CSV file'''
 
 from datetime import datetime, timedelta
-from threading import Thread
+from threading import Thread, Event
 import time
 import pandas as pd
 import sys
@@ -11,8 +11,6 @@ from ibapi.client import EClient, Contract
 from ibapi.wrapper import EWrapper
 from ibapi.utils import iswrapper
 
-import pdb
-
 class WriteFuturesToCSV(EWrapper, EClient):
     ''' Serves as the client and the wrapper '''
 
@@ -21,21 +19,22 @@ class WriteFuturesToCSV(EWrapper, EClient):
 
         # Initialize properties
         self.orderId = None
-        self.accountsList = ""        
+        self.accountsList = None       
         self.local_symbol = None
         self.multiplier = None
-        self.symbols = {'BANKNIFTY':'NSE','NIFTY50':'NSE'}
-        # self.symbols = {'TCS':'NSE','SBIN':'NSE'}
-        self.reached_historicalDataEnd_callback = False # when historicalDataEnd callback is complete, this is set to True
-        # This flag is Used to set the wait time . Easier alternative to Event loop of threading
-        self.reached_contractDetailsEnd_callback = False
         
-        self.date_dq = collections.deque() # Store Contract ID in deque
-        self.open_dq = collections.deque() # Store Contract ID in deque
-        self.high_dq = collections.deque() # Store Contract ID in deque
-        self.low_dq = collections.deque() # Store Contract ID in deque
-        self.close_dq = collections.deque() # Store Contract ID in deque
-        self.volume_dq = collections.deque() # Store Contract ID in deque
+        self.date_dq = collections.deque() # to Store date in deque
+        self.open_dq = collections.deque() # to Store open in deque
+        self.high_dq = collections.deque() # to Store high in deque
+        self.low_dq = collections.deque() # to Store low in deque
+        self.close_dq = collections.deque() # to Store close in deque
+        self.volume_dq = collections.deque() # to Store volume in deque
+        
+        self.nextValidId_available = Event() # Initialize an Event object
+        self.contractDetailsEnd_available = Event() # Initialize an Event object
+        self.historicalDataEnd_available = Event() # Initialize an Event object
+        
+        self.symbols = {'BANKNIFTY':'NSE','NIFTY50':'NSE','SBIN':'NSE'}
 
         # Connect to TWS
         self.connect(addr, port, client_id)
@@ -48,6 +47,7 @@ class WriteFuturesToCSV(EWrapper, EClient):
     def nextValidId(self, orderId):
         ''' Provides the next order ID '''
         self.orderId = orderId
+        self.nextValidId_available.set() #internal flag is set to True
 
     @iswrapper
     def managedAccounts(self, accountsList):
@@ -67,7 +67,7 @@ class WriteFuturesToCSV(EWrapper, EClient):
     def contractDetailsEnd(self, req_id: int):
         '''After all contracts matching the request were returned, this method will mark the end of their reception.'''
         # print("ContractDetailsEnd. ReqId:", req_id)
-        self.reached_contractDetailsEnd_callback = True
+        self.contractDetailsEnd_available.set() #internal flag is set to True
             
     @iswrapper
     def historicalData(self, req_id, bar):
@@ -79,12 +79,12 @@ class WriteFuturesToCSV(EWrapper, EClient):
         self.low_dq.append(bar.low)
         self.close_dq.append(bar.close)
         self.volume_dq.append(bar.volume)
-        
+                
     @iswrapper
     def historicalDataEnd(self, req_id: int, start: str, end: str):
         '''Marks the ending of the historical bars reception.'''
         # print('HistoricalDataEnd. ReqId: {} from {} to {}'.format( req_id, start, end))
-        self.reached_historicalDataEnd_callback = True
+        self.historicalDataEnd_available.set() #internal flag is set to True
         
     def error(self, req_id, code, msg):
         print('Error {}: {}'.format(code, msg))
@@ -92,12 +92,11 @@ class WriteFuturesToCSV(EWrapper, EClient):
 def main():
     # Create the client and connect to TWS
     client = WriteFuturesToCSV('127.0.0.1', 7497, 0)
-    while client.orderId is None:
-        time.sleep(0.1)
-        
-    print ('\n   Good to Go. We are Connected to TWS')
+    client.nextValidId_available.wait() # block thread until internal flag is set to True
+    
+    print ('\n   Good to Go Baba. We are Connected to TWS')
     print ('   The Order Id is: {}'.format(client.orderId))
-    print ('   The Account Details are: {}'.format(client.accountsList))
+    print ('   The Account Details are: {}\n'.format(client.accountsList))
 
     # Get expiration dates for contracts
     for count, symbol in enumerate(client.symbols):
@@ -110,16 +109,18 @@ def main():
         contract.currency = "INR"
         contract.includeExpired = True
         
+        client.contractDetailsEnd_available.clear() #internal flag is set to False
         client.reqContractDetails(count, contract)
-        while (client.reached_contractDetailsEnd_callback is False):
-            time.sleep(0.1)
-        if client.reached_contractDetailsEnd_callback is True:
-            client.reached_contractDetailsEnd_callback = False
+        client.contractDetailsEnd_available.wait() # block thread until internal flag is set to True
 
         # Request historical data for each contract
         if client.local_symbol:
             print ('Local Symbol : {}'.format(client.local_symbol))
             print ('Symbol : {}'.format(symbol))
+            
+            # Set additional contract data
+            contract.localSymbol = client.local_symbol
+            contract.multiplier = client.multiplier
             
             # Initialize the deque
             client.date_dq.clear()
@@ -128,20 +129,13 @@ def main():
             client.low_dq.clear()
             client.close_dq.clear()
             client.volume_dq.clear()
-
-            # Set additional contract data
-            contract.localSymbol = client.local_symbol
-            contract.multiplier = client.multiplier
+            
+            client.historicalDataEnd_available.clear() #internal flag is set to False
 
             # Request historical data
             query_time = (datetime.today().date() - timedelta(days=0)).strftime("%Y%m%d %H:%M:%S")
-            client.reqHistoricalData(count, contract, query_time,
-                '2 Y', '1 day', 'TRADES', 1, 1, False, [])            
-            
-            while (client.reached_historicalDataEnd_callback is False):
-                time.sleep(0.1)
-            if client.reached_historicalDataEnd_callback is True:
-                client.reached_historicalDataEnd_callback = False
+            client.reqHistoricalData(count, contract, query_time, '2 Y', '1 day', 'TRADES', 1, 1, False, [])
+            client.historicalDataEnd_available.wait() # block thread until internal flag is set to True
             
             #  Create List
             date_list = list(client.date_dq)
@@ -157,8 +151,6 @@ def main():
             df.columns=['Date', 'Open', 'High', 'Low', 'Close', 'Volume']
             df['Date'] = pd.to_datetime(df['Date']) # Convert to pandas DateTime format
             df = df[df.Volume != 0] # Drop all entries for which volume traded = 0
-            # print(df.tail())
-            # print(df.columns)
             df.to_csv(client.local_symbol + '.csv', encoding='utf-8', index=False)
             
             combined_list = [] # Empty the List
@@ -171,5 +163,4 @@ def main():
     client.disconnect()
 
 if __name__ == '__main__':
-    # pdb.set_trace()
     main()
